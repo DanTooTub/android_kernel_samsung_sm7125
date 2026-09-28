@@ -1,0 +1,88 @@
+name: Build riseKernel with SUSFS (Flashable ZIP)
+
+on:
+  workflow_dispatch: # Запуск вручную кнопкой во вкладке Actions
+
+jobs:
+  build-kernel:
+    runs-on: ubuntu-20.04
+
+    steps:
+      - name: Checkout Kernel Source
+        uses: actions/checkout@v4
+        with:
+          ref: rise-14-ksu
+          fetch-depth: 1
+
+      - name: Install Build Dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y bc build-essential libssl-dev libcrypto++-dev libncurses5-dev bzip2 gzip cpio libelf-dev zip
+
+      - name: Download Google Clang & GCC Toolchains
+        run: |
+          mkdir -p $GITHUB_WORKSPACE/toolchains
+          cd $GITHUB_WORKSPACE/toolchains
+          # Качаем prebuilt Clang r383902, который указан в build_a52q.sh
+          git clone --depth=1 https://googlesource.com $GITHUB_WORKSPACE/toolchains/clang-host
+          # Вытягиваем совместимые версии GCC для кросс-компиляции bare-metal
+          git clone --depth=1 https://googlesource.com $GITHUB_WORKSPACE/toolchains/gcc64
+          git clone --depth=1 https://googlesource.com $GITHUB_WORKSPACE/toolchains/gcc32
+
+      - name: Download and Apply SUSFS Patch
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com susfs_src
+          
+          # Копируем исходники ядра SUSFS в структуру
+          cp -r susfs_src/Kernel_Patch/fs/susfs fs/
+          cp susfs_src/Kernel_Patch/include/linux/susfs.h include/linux/
+          
+          # Применяем патчи VFS для старой ветки ядра 4.14
+          cd susfs_src/Kernel_Patch/
+          git apply --directory=$GITHUB_WORKSPACE Patches/Kernel_Patch_For_4.14.patch || true
+
+      - name: Inject SUSFS Config Flags
+        run: |
+          CONFIG_FILE="arch/arm64/configs/a52q_eur_open_defconfig"
+          echo "" >> $CONFIG_FILE
+          echo "CONFIG_SUSFS=y" >> $CONFIG_FILE
+          echo "CONFIG_SUSFS_SUS_PATH=y" >> $CONFIG_FILE
+          echo "CONFIG_SUSFS_HIDE_PORTS=y" >> $CONFIG_FILE
+
+      - name: Compile Kernel
+        run: |
+          export PATH="$GITHUB_WORKSPACE/toolchains/clang-host/clang-r383902/bin:$GITHUB_WORKSPACE/toolchains/gcc64/bin:$GITHUB_WORKSPACE/toolchains/gcc32/bin:$PATH"
+          export ARCH=arm64
+          export SUBARCH=arm64
+          
+          # Сборка по инструкциям из build_a52q.sh автора
+          make O=out a52q_eur_open_defconfig
+          make -j$(nproc) O=out CC=clang CLANG_TRIPLE=aarch64-linux-gnu- CROSS_COMPILE=aarch64-linux-android- CROSS_COMPILE_ARM32=arm-linux-androideabi-
+
+      - name: Pack Kernel into Flashable ZIP (AnyKernel3)
+        run: |
+          cd $GITHUB_WORKSPACE
+          git clone --depth=1 https://github.com anykernel
+          cd anykernel
+          
+          # Жестко прописываем параметры разметки под Samsung A52
+          sed -i 's/do.devicecheck=1/do.devicecheck=0/g' anykernel.sh
+          sed -i 's/block=auto;/block=\/dev\/block\/by-name\/boot;/g' anykernel.sh
+          sed -i 's/is_slot_device=0;/is_slot_device=auto;/g' anykernel.sh
+          
+          # Закидываем скомпилированный бинарник ядра (в зависимости от формата вывода make)
+          if [ -f "../out/arch/arm64/boot/Image.gz-dtb" ]; then
+            cp ../out/arch/arm64/boot/Image.gz-dtb ./Image.gz-dtb
+          elif [ -f "../out/arch/arm64/boot/Image.gz" ]; then
+            cp ../out/arch/arm64/boot/Image.gz ./Image.gz
+          fi
+          
+          # Упаковываем всё в прошиваемый ZIP
+          zip -r9 ../riseKernel-v1.3-a52q-SUSFS.zip * -x .git* README.md
+
+      - name: Upload Flashable ZIP Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: riseKernel-a52q-Flashable-ZIP
+          path: riseKernel-v1.3-a52q-SUSFS.zip
